@@ -74,6 +74,10 @@ struct PrimeRamulatorBridge {
   unsigned long long direct_prime_chunks_issued = 0;
   unsigned long long direct_prime_chunks_completed = 0;
 
+  unsigned long long hbm_comp_physical_reads_sent = 0;
+  unsigned long long hbm_comp_chunks_issued = 0;
+  unsigned long long hbm_comp_chunks_completed = 0;
+
   int frontend_tick_ratio = 1;
   int memory_tick_ratio = 1;
   int frontend_counter = 0;
@@ -81,6 +85,7 @@ struct PrimeRamulatorBridge {
 
   bool prime_mode = false;
   bool prime_direct_mode = false;
+  bool hbm_side_comp_mode = false;
 
   int prime_chunk_bytes = 128;       // two 64B uncompressed blocks
   int prime_compressed_bytes = 96;   // two 48B compressed blocks
@@ -91,11 +96,20 @@ struct PrimeRamulatorBridge {
   int prime_direct_channels = 8;
   int next_direct_prime_chunk_id = 0;
 
+  int hbm_comp_chunk_bytes = 128;       // host-visible logical block
+  int hbm_comp_compressed_bytes = 96;   // compressed physical block
+  int hbm_comp_tx_bytes = 32;           // HBM2 transaction size
+  int hbm_comp_decomp_latency = 3;      // logic-die decompression latency
+  int hbm_comp_mapping_latency = 0;     // V1 fixed mapping, default zero
+
   std::unordered_map<unsigned long long, PrimeChunkState> prime_chunks;
   std::deque<PrimeInternalRetry> prime_retry_q;
 
   std::unordered_map<unsigned long long, DirectPrimeChunkState> direct_prime_chunks;
   std::deque<DirectPrimeRetry> direct_prime_retry_q;
+
+  std::unordered_map<unsigned long long, PrimeChunkState> hbm_comp_chunks;
+  std::deque<PrimeInternalRetry> hbm_comp_retry_q;
 };
 
 static bool env_enabled(const char* name) {
@@ -110,12 +124,32 @@ static int env_int(const char* name, int fallback) {
   return x > 0 ? x : fallback;
 }
 
+static int env_int_nonnegative(const char* name, int fallback) {
+  const char* v = std::getenv(name);
+  if (!v || !v[0]) return fallback;
+  int x = std::atoi(v);
+  return x >= 0 ? x : fallback;
+}
+
 static unsigned long long prime_chunk_key_of(PrimeRamulatorBridge* h, unsigned long long addr) {
   return addr / static_cast<unsigned long long>(h->prime_chunk_bytes);
 }
 
 static unsigned long long prime_compressed_base_of(PrimeRamulatorBridge* h, unsigned long long chunk_key) {
   return chunk_key * static_cast<unsigned long long>(h->prime_compressed_bytes);
+}
+
+static unsigned long long hbm_comp_chunk_key_of(PrimeRamulatorBridge* h, unsigned long long addr) {
+  return addr / static_cast<unsigned long long>(h->hbm_comp_chunk_bytes);
+}
+
+static unsigned long long hbm_comp_compressed_base_of(
+    PrimeRamulatorBridge* h,
+    unsigned long long chunk_key
+) {
+  // Version 1 fixed mapping:
+  // logical block N maps to compressed physical block N.
+  return chunk_key * static_cast<unsigned long long>(h->hbm_comp_compressed_bytes);
 }
 
 static DirectPrimeMeta make_direct_prime_meta(PrimeRamulatorBridge* h, unsigned long long chunk_key) {
@@ -254,6 +288,118 @@ static bool send_prime_parent_read(
       bool ok = issue_prime_internal_read(h, caddr, chunk_key);
       if (!ok) {
         h->prime_retry_q.push_back({caddr, chunk_key});
+      }
+    }
+  }
+
+  return true;
+}
+
+
+static bool issue_hbm_comp_internal_read(
+    PrimeRamulatorBridge* h,
+    unsigned long long compressed_addr,
+    unsigned long long chunk_key
+) {
+  auto callback = [h, chunk_key](Request& req) {
+    (void)req;
+
+    auto it = h->hbm_comp_chunks.find(chunk_key);
+    if (it == h->hbm_comp_chunks.end()) return;
+
+    if (it->second.remaining_compressed_reads > 0) {
+      it->second.remaining_compressed_reads--;
+    }
+
+    if (it->second.remaining_compressed_reads == 0 && !it->second.ready) {
+      it->second.ready_cycle =
+          h->cycle +
+          static_cast<unsigned long long>(h->hbm_comp_mapping_latency) +
+          static_cast<unsigned long long>(h->hbm_comp_decomp_latency);
+    }
+  };
+
+  bool ok = h->frontend->receive_external_requests(
+      Request::Type::Read,
+      static_cast<Addr_t>(compressed_addr),
+      0,
+      callback,
+      h->hbm_comp_tx_bytes
+  );
+
+  if (ok) {
+    h->hbm_comp_physical_reads_sent++;
+    return true;
+  }
+
+  return false;
+}
+
+static void drain_hbm_comp_internal_retry(PrimeRamulatorBridge* h) {
+  while (!h->hbm_comp_retry_q.empty()) {
+    PrimeInternalRetry r = h->hbm_comp_retry_q.front();
+
+    bool ok = issue_hbm_comp_internal_read(h, r.addr, r.chunk_key);
+    if (!ok) break;
+
+    h->hbm_comp_retry_q.pop_front();
+  }
+}
+
+static void complete_ready_hbm_comp_chunks(PrimeRamulatorBridge* h) {
+  for (auto& kv : h->hbm_comp_chunks) {
+    PrimeChunkState& st = kv.second;
+
+    if (!st.issued) continue;
+    if (st.ready) continue;
+    if (st.remaining_compressed_reads != 0) continue;
+    if (h->cycle < st.ready_cycle) continue;
+
+    st.ready = true;
+    h->hbm_comp_chunks_completed++;
+
+    for (int user_sid : st.waiting_user_source_ids) {
+      h->completed_source_ids.push_back(user_sid);
+      h->completed++;
+    }
+    st.waiting_user_source_ids.clear();
+  }
+}
+
+static bool send_hbm_comp_parent_read(
+    PrimeRamulatorBridge* h,
+    unsigned long long addr,
+    int user_source_id
+) {
+  unsigned long long chunk_key = hbm_comp_chunk_key_of(h, addr);
+  PrimeChunkState& st = h->hbm_comp_chunks[chunk_key];
+
+  h->sent++;
+
+  if (st.ready) {
+    h->completed_source_ids.push_back(user_source_id);
+    h->completed++;
+    return true;
+  }
+
+  st.waiting_user_source_ids.push_back(user_source_id);
+
+  if (!st.issued) {
+    st.issued = true;
+    st.remaining_compressed_reads =
+        (h->hbm_comp_compressed_bytes + h->hbm_comp_tx_bytes - 1) /
+        h->hbm_comp_tx_bytes;
+    h->hbm_comp_chunks_issued++;
+
+    unsigned long long cbase = hbm_comp_compressed_base_of(h, chunk_key);
+
+    for (int i = 0; i < st.remaining_compressed_reads; i++) {
+      unsigned long long caddr =
+          cbase + static_cast<unsigned long long>(i * h->hbm_comp_tx_bytes);
+
+      bool ok = issue_hbm_comp_internal_read(h, caddr, chunk_key);
+      if (!ok) {
+        h->hbm_comp_retry_q.push_back({caddr, chunk_key});
       }
     }
   }
