@@ -18,7 +18,7 @@ struct Request {
   // Universal built-in external request types — always Read = 0, Write = 1.
   // Additional non-negative ids may exist as metadata for future extensions.
   struct Type {
-    enum : int { Read = 0, Write = 1 };
+    enum : int { Read = 0, Write = 1, Prime = 2 };
   };
 
   int type_id = -1;    // Request type. -1 is the convention for internal maintenance/direct-command requests.

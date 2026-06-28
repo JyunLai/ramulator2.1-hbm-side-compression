@@ -38,6 +38,7 @@ target_sources(
   impl/hbm_controller_base.h
   impl/hbm_controller_base.cpp
   impl/hbm12_controller.cpp
+  impl/prime_hbm12_controller.cpp
   impl/hbm34_controller.cpp
 )
 

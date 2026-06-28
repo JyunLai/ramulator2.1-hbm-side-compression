@@ -8,5 +8,6 @@ from .generic_ddr import GenericDDR
 from .hbm12 import HBM12
 from .hbm34 import HBM34
 from .lpddr5 import LPDDR5
+from .prime_hbm12 import PrimeHBM12
 
-__all__ = ['GenericDDR', 'HBM12', 'HBM34', 'LPDDR5']
+__all__ = ['GenericDDR', 'HBM12', 'HBM34', 'LPDDR5', 'PrimeHBM12']

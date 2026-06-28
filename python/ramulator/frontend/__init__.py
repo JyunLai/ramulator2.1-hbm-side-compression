@@ -7,7 +7,9 @@
 from .external import External
 from .latency_throughput_trace import LatencyThroughputTrace
 from .load_store_trace import LoadStoreTrace
+from .prime_request_trace import PrimeRequestTrace
+from .prime_trace import PrimeTrace
 from .read_write_trace import ReadWriteTrace
 from .simple_o3 import SimpleO3
 
-__all__ = ['External', 'LatencyThroughputTrace', 'LoadStoreTrace', 'ReadWriteTrace', 'SimpleO3']
+__all__ = ['External', 'LatencyThroughputTrace', 'LoadStoreTrace', 'PrimeRequestTrace', 'PrimeTrace', 'ReadWriteTrace', 'SimpleO3']

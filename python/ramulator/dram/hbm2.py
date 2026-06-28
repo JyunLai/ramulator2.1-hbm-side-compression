@@ -23,6 +23,9 @@ class HBM2(DRAMStandard):
         "ACT", "PREpb", "PREab",
         "RD", "WR", "RDA", "WRA",
         "REFab", "REFpb",
+        "PRIME_RD96",
+        "XMC_DECOMP",
+        "PRIME_WB",
     ]
 
     # ---- CA bus cycle count per command ----
@@ -43,6 +46,7 @@ class HBM2(DRAMStandard):
         "nWTRS", "nWTRL",
         "nFAW", "nRFC", "nRFCpb", "nRREFD",
         "nREFI", "nREFIpb",
+        "nPRIMEWB",
         "tCK_ps",
     ]
 
@@ -111,6 +115,10 @@ class HBM2(DRAMStandard):
         TimingConstraint(level="Bank", preceding=["WR"], following=["PREpb"], latency="nCWL + nBL + nWR"),
         TimingConstraint(level="Bank", preceding=["RDA"], following=["ACT"], latency="nRTPL + nRP"),
         TimingConstraint(level="Bank", preceding=["WRA"], following=["ACT"], latency="nCWL + nBL + nWR + nRP"),
+
+        # Bank — PriME internal odd-bank writeback resource.
+        # One PRIME_WB reserves the target odd bank for nPRIMEWB cycles.
+        TimingConstraint(level="Bank", preceding=["PRIME_WB"], following=["PRIME_WB"], latency="nPRIMEWB"),
 
         # Bank — per-bank refresh (REFSB)
         TimingConstraint(level="Bank", preceding=["REFpb"], following=["ACT"], latency="nRFCpb"),
@@ -200,18 +208,21 @@ HBM2.timing_presets = {
         "rate": 1600, "nBL": 2, "nCL": 10, "nRCDRD": 10, "nRCDWR": 8,
         "nRP": 10, "nRAS": 24, "nRC": 34, "nWR": 12, "nRTPL": 4, "nCWL": 4,
         "nCCDS": 2, "nCCDL": 4, "nWTRS": 5, "nWTRL": 6,
+        "nPRIMEWB": 4,
         "tCK_ps": 1250,
     },
     "HBM2_2000Mbps": {
         "rate": 2000, "nBL": 2, "nCL": 14, "nRCDRD": 14, "nRCDWR": 12,
         "nRP": 14, "nRAS": 34, "nRC": 48, "nWR": 16, "nRTPL": 5, "nCWL": 5,
         "nCCDS": 2, "nCCDL": 4, "nWTRS": 6, "nWTRL": 8,
+        "nPRIMEWB": 4,
         "tCK_ps": 1000,
     },
     "HBM2_2400Mbps": {
         "rate": 2400, "nBL": 2, "nCL": 17, "nRCDRD": 17, "nRCDWR": 14,
         "nRP": 17, "nRAS": 40, "nRC": 57, "nWR": 19, "nRTPL": 6, "nCWL": 6,
         "nCCDS": 2, "nCCDL": 4, "nWTRS": 8, "nWTRL": 10,
+        "nPRIMEWB": 4,
         "tCK_ps": 833,
     },
 }

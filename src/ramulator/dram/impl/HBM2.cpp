@@ -9,12 +9,15 @@
 #include "ramulator/dram/commands/ACT.h"
 #include "ramulator/dram/commands/PREab.h"
 #include "ramulator/dram/commands/PREpb.h"
+#include "ramulator/dram/commands/PRIME_RD96.h"
+#include "ramulator/dram/commands/PRIME_WB.h"
 #include "ramulator/dram/commands/RD.h"
 #include "ramulator/dram/commands/RDA.h"
 #include "ramulator/dram/commands/REFab.h"
 #include "ramulator/dram/commands/REFpb.h"
 #include "ramulator/dram/commands/WR.h"
 #include "ramulator/dram/commands/WRA.h"
+#include "ramulator/dram/commands/XMC_DECOMP.h"
 #include "ramulator/dram/commands/populate.h"
 #include "ramulator/dram/dram_spec.h"
 
@@ -26,7 +29,7 @@ class HBM2 : public DRAMSpec {
     enum : int { Channel, PseudoChannel, BankGroup, Bank, Row, Column, COUNT };
   };
   struct Command {
-    enum : int { ACT, PREpb, PREab, RD, WR, RDA, WRA, REFab, REFpb, COUNT };
+    enum : int { ACT, PREpb, PREab, RD, WR, RDA, WRA, REFab, REFpb, PRIME_RD96, XMC_DECOMP, PRIME_WB, COUNT };
   };
   struct State {
     enum : int { Opened, Closed, N_A, COUNT };
@@ -56,13 +59,15 @@ class HBM2 : public DRAMSpec {
       nRREFD,
       nREFI,
       nREFIpb,
+      nPRIMEWB,
       tCK_ps,
       COUNT
     };
   };
 
   using CommandImpls = std::tuple<Cmd::ACT<HBM2>, Cmd::PREpb<HBM2>, Cmd::PREab<HBM2>, Cmd::RD<HBM2>, Cmd::WR<HBM2>,
-                                  Cmd::RDA<HBM2>, Cmd::WRA<HBM2>, Cmd::REFab<HBM2>, Cmd::REFpb<HBM2> >;
+                                  Cmd::RDA<HBM2>, Cmd::WRA<HBM2>, Cmd::REFab<HBM2>, Cmd::REFpb<HBM2>,
+                                  Cmd::PRIME_RD96<HBM2>, Cmd::XMC_DECOMP<HBM2>, Cmd::PRIME_WB<HBM2> >;
 
   HBM2(const ConfigNode& config) {
     // Counts
@@ -73,11 +78,14 @@ class HBM2 : public DRAMSpec {
 
     // String name maps + reverse lookup vectors
     set_names(levels, level_names, {"Channel", "PseudoChannel", "BankGroup", "Bank", "Row", "Column"});
-    set_names(commands, command_names, {"ACT", "PREpb", "PREab", "RD", "WR", "RDA", "WRA", "REFab", "REFpb"});
+    set_names(
+        commands, command_names,
+        {"ACT", "PREpb", "PREab", "RD", "WR", "RDA", "WRA", "REFab", "REFpb", "PRIME_RD96", "XMC_DECOMP", "PRIME_WB"});
     set_names(states, state_names, {"Opened", "Closed", "N_A"});
-    set_names(timings, timing_names, {"rate",  "nBL",   "nCL",  "nRCDRD", "nRCDWR", "nRP",   "nRAS",    "nRC",
-                                      "nWR",   "nRTPL", "nCWL", "nCCDS",  "nCCDL",  "nRRDS", "nRRDL",   "nWTRS",
-                                      "nWTRL", "nFAW",  "nRFC", "nRFCpb", "nRREFD", "nREFI", "nREFIpb", "tCK_ps"});
+    set_names(timings, timing_names,
+              {"rate",  "nBL",    "nCL",    "nRCDRD", "nRCDWR",  "nRP",      "nRAS",  "nRC",   "nWR",
+               "nRTPL", "nCWL",   "nCCDS",  "nCCDL",  "nRRDS",   "nRRDL",    "nWTRS", "nWTRL", "nFAW",
+               "nRFC",  "nRFCpb", "nRREFD", "nREFI",  "nREFIpb", "nPRIMEWB", "tCK_ps"});
 
     // Static spec data
     internal_prefetch_size = 4;

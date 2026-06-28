@@ -16,6 +16,5 @@ IncludeCategories:
 AllowShortFunctionsOnASingleLine: None
 AllowShortIfStatementsOnASingleLine: Never
 AllowShortLoopsOnASingleLine: false
-InsertBraces: true
 DerivePointerAlignment: false
 SpaceAfterCStyleCast: false

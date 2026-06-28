@@ -26,3 +26,36 @@ sweep_log.txt
 
 *.out
 *.json
+
+# local build / cmake
+build/
+Testing/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# logs and temporary outputs
+logs*/
+results/
+traces_accelsim_replay/
+examples/traces/
+examples/traces_bankpair/
+examples/traces_multich/
+examples/traces_p/
+*.log
+*.csv
+*.png
+*.svg
+
+# generated / temporary files
+*.bak
+*.bak_*
+exported_*.yaml
+read_latency
+depart
+=
+
+# python cache
+__pycache__/
+*.pyc
