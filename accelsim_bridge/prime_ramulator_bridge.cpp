@@ -100,6 +100,7 @@ struct PrimeRamulatorBridge {
   int hbm_comp_compressed_bytes = 96;   // compressed physical block
   int hbm_comp_tx_bytes = 32;           // HBM2 transaction size
   int hbm_comp_decomp_latency = 3;      // logic-die decompression latency
+  bool hbm_comp_debug_printed = false;
   int hbm_comp_mapping_latency = 0;     // V1 fixed mapping, default zero
 
   std::unordered_map<unsigned long long, PrimeChunkState> prime_chunks;
@@ -374,6 +375,18 @@ static bool send_hbm_comp_parent_read(
   unsigned long long chunk_key = hbm_comp_chunk_key_of(h, addr);
   PrimeChunkState& st = h->hbm_comp_chunks[chunk_key];
 
+  if (!h->hbm_comp_debug_printed) {
+    h->hbm_comp_debug_printed = true;
+    std::cerr << "[hbm_side_comp_first_read]"
+              << " addr=" << addr
+              << " chunk_key=" << chunk_key
+              << " compressed_base=" << hbm_comp_compressed_base_of(h, chunk_key)
+              << " logical_chunk_bytes=" << h->hbm_comp_chunk_bytes
+              << " compressed_bytes=" << h->hbm_comp_compressed_bytes
+              << " tx_bytes=" << h->hbm_comp_tx_bytes
+              << "\n";
+  }
+
   h->sent++;
 
   if (st.ready) {
@@ -524,6 +537,7 @@ extern "C" void* prime_ramulator_create(const char* config_path) {
 
     h->prime_mode = env_enabled("ACCELSIM_RAMULATOR_PRIME_MODE");
     h->prime_direct_mode = env_enabled("ACCELSIM_RAMULATOR_PRIME_DIRECT");
+      h->hbm_side_comp_mode = env_enabled("ACCELSIM_HBM_SIDE_COMP_MODE");
 
     h->prime_decomp_latency = env_int("ACCELSIM_PRIME_DECOMP_LATENCY", 3);
     h->prime_wb_latency = env_int("ACCELSIM_PRIME_WB_LATENCY", 4);
@@ -531,6 +545,18 @@ extern "C" void* prime_ramulator_create(const char* config_path) {
     h->prime_compressed_bytes = env_int("ACCELSIM_PRIME_COMPRESSED_BYTES", 96);
     h->prime_tx_bytes = env_int("ACCELSIM_PRIME_TX_BYTES", 32);
     h->prime_direct_channels = env_int("ACCELSIM_PRIME_DIRECT_CHANNELS", 8);
+
+      h->hbm_comp_chunk_bytes =
+          env_int("ACCELSIM_HBM_COMP_LOGICAL_CHUNK_BYTES",
+                  env_int("ACCELSIM_HBM_COMP_CHUNK_BYTES", 128));
+      h->hbm_comp_compressed_bytes =
+          env_int("ACCELSIM_HBM_COMP_COMPRESSED_BYTES",
+                  env_int("ACCELSIM_HBM_COMP_COMPRESSED_CHUNK_BYTES", 96));
+      h->hbm_comp_tx_bytes = env_int("ACCELSIM_HBM_COMP_TX_BYTES", 32);
+      h->hbm_comp_decomp_latency =
+          env_int("ACCELSIM_HBM_COMP_DECOMP_LATENCY", 3);
+      h->hbm_comp_mapping_latency =
+          env_int_nonnegative("ACCELSIM_HBM_COMP_MAPPING_LATENCY", 0);
 
     ConfigNode cfg = Config::parse_config_file(std::string(config_path));
 
@@ -562,6 +588,14 @@ extern "C" void* prime_ramulator_create(const char* config_path) {
               << " prime_decomp_latency=" << h->prime_decomp_latency
               << " prime_wb_latency=" << h->prime_wb_latency
               << "\n";
+      std::cerr << "[hbm_side_comp_config]"
+                << " hbm_side_comp_mode=" << (h->hbm_side_comp_mode ? 1 : 0)
+                << " hbm_comp_chunk_bytes=" << h->hbm_comp_chunk_bytes
+                << " hbm_comp_compressed_bytes=" << h->hbm_comp_compressed_bytes
+                << " hbm_comp_decomp_latency=" << h->hbm_comp_decomp_latency
+                << " hbm_comp_mapping_latency=" << h->hbm_comp_mapping_latency
+                << "\n";
+
 
     return h;
   } catch (const std::exception& e) {
@@ -602,6 +636,13 @@ extern "C" int prime_ramulator_send(
 
   // PriME mode v1:
   // Bridge internally transforms reads into compressed 96B HBM2 reads.
+  // HBM-side Compression V1:
+  // Compressed 96B HBM2 reads + logic-die decompression + direct return.
+  if (h->hbm_side_comp_mode && !is_write) {
+    (void)size_bytes;
+    return send_hbm_comp_parent_read(h, addr, user_source_id) ? 1 : 0;
+  }
+
   if (h->prime_mode && !is_write) {
     (void)size_bytes;
     return send_prime_parent_read(h, addr, user_source_id) ? 1 : 0;
@@ -648,6 +689,8 @@ extern "C" void prime_ramulator_tick(void* handle) {
 
   if (h->prime_direct_mode) {
     drain_direct_prime_retry(h);
+  } else if (h->hbm_side_comp_mode) {
+    drain_hbm_comp_internal_retry(h);
   } else if (h->prime_mode) {
     drain_prime_internal_retry(h);
   }
@@ -662,7 +705,9 @@ extern "C" void prime_ramulator_tick(void* handle) {
     h->memory_system->tick();
   }
 
-  if (!h->prime_direct_mode && h->prime_mode) {
+  if (!h->prime_direct_mode && h->hbm_side_comp_mode) {
+    complete_ready_hbm_comp_chunks(h);
+  } else if (!h->prime_direct_mode && h->prime_mode) {
     complete_ready_prime_chunks(h);
   }
 
@@ -735,6 +780,16 @@ extern "C" void prime_ramulator_destroy(void* handle) {
               << " direct_prime_retry_q=" << h->direct_prime_retry_q.size()
               << "\n";
   }
+    if (h) {
+      std::cerr << "[hbm_side_comp_stats]"
+                << " hbm_side_comp_mode=" << (h->hbm_side_comp_mode ? 1 : 0)
+                << " hbm_comp_chunks_issued=" << h->hbm_comp_chunks_issued
+                << " hbm_comp_chunks_completed=" << h->hbm_comp_chunks_completed
+                << " hbm_comp_physical_reads_sent=" << h->hbm_comp_physical_reads_sent
+                << " hbm_comp_retry_q=" << h->hbm_comp_retry_q.size()
+                << "\n";
+    }
+
 
   delete h;
 }
