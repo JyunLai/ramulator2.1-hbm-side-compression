@@ -101,6 +101,7 @@ struct PrimeRamulatorBridge {
   int hbm_comp_tx_bytes = 32;           // HBM2 transaction size
   int hbm_comp_decomp_latency = 3;      // logic-die decompression latency
   bool hbm_comp_debug_printed = false;
+  bool hbm_comp_padded_mapping = false;
   int hbm_comp_mapping_latency = 0;     // V1 fixed mapping, default zero
 
   std::unordered_map<unsigned long long, PrimeChunkState> prime_chunks;
@@ -111,7 +112,107 @@ struct PrimeRamulatorBridge {
 
   std::unordered_map<unsigned long long, PrimeChunkState> hbm_comp_chunks;
   std::deque<PrimeInternalRetry> hbm_comp_retry_q;
+
+  // HBM-side Compression statistics.
+  unsigned long long hbm_comp_parent_reads = 0;
+  unsigned long long hbm_comp_parent_read_bytes = 0;
+  std::unordered_map<unsigned long long, unsigned long long> hbm_comp_sector_mask;
 };
+
+static PrimeRamulatorBridge* g_hbm_comp_last_bridge = nullptr;
+static bool g_hbm_comp_atexit_registered = false;
+
+static unsigned int hbm_comp_popcount64(unsigned long long x) {
+  unsigned int c = 0;
+  while (x) {
+    c += static_cast<unsigned int>(x & 1ULL);
+    x >>= 1;
+  }
+  return c;
+}
+
+static void hbm_comp_print_summary(PrimeRamulatorBridge* h, const char* tag) {
+  if (!h || !h->hbm_side_comp_mode) return;
+
+  unsigned long long unique_chunks =
+      static_cast<unsigned long long>(h->hbm_comp_sector_mask.size());
+
+  unsigned long long sectors_touched = 0;
+  for (const auto& kv : h->hbm_comp_sector_mask) {
+    sectors_touched += hbm_comp_popcount64(kv.second);
+  }
+
+  unsigned long long tx_bytes =
+      static_cast<unsigned long long>(h->hbm_comp_tx_bytes > 0 ? h->hbm_comp_tx_bytes : 32);
+
+  unsigned long long chunk_bytes =
+      static_cast<unsigned long long>(h->hbm_comp_chunk_bytes > 0 ? h->hbm_comp_chunk_bytes : 128);
+
+  unsigned long long compressed_bytes =
+      static_cast<unsigned long long>(h->hbm_comp_compressed_bytes > 0 ? h->hbm_comp_compressed_bytes : 96);
+
+  unsigned long long sectors_per_chunk =
+      (chunk_bytes + tx_bytes - 1) / tx_bytes;
+
+  unsigned long long physical_read_bytes =
+      h->hbm_comp_physical_reads_sent * tx_bytes;
+
+  unsigned long long compressed_chunk_bytes_issued =
+      h->hbm_comp_chunks_issued * compressed_bytes;
+
+  unsigned long long uncompressed_chunk_bytes_touched =
+      unique_chunks * chunk_bytes;
+
+  double avg_parent_reads_per_chunk =
+      unique_chunks ? static_cast<double>(h->hbm_comp_parent_reads) / unique_chunks : 0.0;
+
+  double avg_sectors_per_chunk =
+      unique_chunks ? static_cast<double>(sectors_touched) / unique_chunks : 0.0;
+
+  double sector_util =
+      (unique_chunks && sectors_per_chunk)
+          ? static_cast<double>(sectors_touched) /
+                static_cast<double>(unique_chunks * sectors_per_chunk)
+          : 0.0;
+
+  double physical_vs_parent_byte_ratio =
+      h->hbm_comp_parent_read_bytes
+          ? static_cast<double>(physical_read_bytes) /
+                static_cast<double>(h->hbm_comp_parent_read_bytes)
+          : 0.0;
+
+  double compressed_vs_uncompressed_chunk_ratio =
+      uncompressed_chunk_bytes_touched
+          ? static_cast<double>(compressed_chunk_bytes_issued) /
+                static_cast<double>(uncompressed_chunk_bytes_touched)
+          : 0.0;
+
+  std::cerr << "[hbm_side_comp_summary]"
+            << " tag=" << tag
+            << " hbm_side_comp_mode=" << (h->hbm_side_comp_mode ? 1 : 0)
+            << " parent_reads=" << h->hbm_comp_parent_reads
+            << " parent_read_bytes_est=" << h->hbm_comp_parent_read_bytes
+            << " unique_chunks_touched=" << unique_chunks
+            << " chunks_issued=" << h->hbm_comp_chunks_issued
+            << " chunks_completed=" << h->hbm_comp_chunks_completed
+            << " physical_reads_sent=" << h->hbm_comp_physical_reads_sent
+            << " physical_read_bytes=" << physical_read_bytes
+            << " compressed_chunk_bytes_issued=" << compressed_chunk_bytes_issued
+            << " uncompressed_chunk_bytes_touched=" << uncompressed_chunk_bytes_touched
+            << " sectors_touched=" << sectors_touched
+            << " sectors_per_chunk=" << sectors_per_chunk
+            << " avg_parent_reads_per_chunk=" << avg_parent_reads_per_chunk
+            << " avg_sectors_per_chunk=" << avg_sectors_per_chunk
+            << " sector_util=" << sector_util
+            << " physical_vs_parent_byte_ratio=" << physical_vs_parent_byte_ratio
+            << " compressed_vs_uncompressed_chunk_ratio=" << compressed_vs_uncompressed_chunk_ratio
+            << "\n";
+}
+
+static void hbm_comp_atexit_dump() {
+  hbm_comp_print_summary(g_hbm_comp_last_bridge, "atexit");
+}
+
 
 static bool env_enabled(const char* name) {
   const char* v = std::getenv(name);
@@ -145,12 +246,12 @@ static unsigned long long hbm_comp_chunk_key_of(PrimeRamulatorBridge* h, unsigne
 }
 
 static unsigned long long hbm_comp_compressed_base_of(
-    PrimeRamulatorBridge* h,
-    unsigned long long chunk_key
-) {
-  // Version 1 fixed mapping:
-  // logical block N maps to compressed physical block N.
-  return chunk_key * static_cast<unsigned long long>(h->hbm_comp_compressed_bytes);
+    PrimeRamulatorBridge* h, unsigned long long chunk_key) {
+  unsigned long long unit =
+      h->hbm_comp_padded_mapping
+          ? static_cast<unsigned long long>(h->hbm_comp_chunk_bytes)
+          : static_cast<unsigned long long>(h->hbm_comp_compressed_bytes);
+  return chunk_key * unit;
 }
 
 static DirectPrimeMeta make_direct_prime_meta(PrimeRamulatorBridge* h, unsigned long long chunk_key) {
@@ -375,6 +476,20 @@ static bool send_hbm_comp_parent_read(
   unsigned long long chunk_key = hbm_comp_chunk_key_of(h, addr);
   PrimeChunkState& st = h->hbm_comp_chunks[chunk_key];
 
+  h->hbm_comp_parent_reads++;
+  h->hbm_comp_parent_read_bytes +=
+      static_cast<unsigned long long>(h->hbm_comp_tx_bytes > 0 ? h->hbm_comp_tx_bytes : 32);
+
+  unsigned long long sector_idx = 0;
+  if (h->hbm_comp_tx_bytes > 0 && h->hbm_comp_chunk_bytes > 0) {
+    sector_idx =
+        (addr % static_cast<unsigned long long>(h->hbm_comp_chunk_bytes)) /
+        static_cast<unsigned long long>(h->hbm_comp_tx_bytes);
+  }
+  if (sector_idx < 64) {
+    h->hbm_comp_sector_mask[chunk_key] |= (1ULL << sector_idx);
+  }
+
   if (!h->hbm_comp_debug_printed) {
     h->hbm_comp_debug_printed = true;
     std::cerr << "[hbm_side_comp_first_read]"
@@ -538,6 +653,7 @@ extern "C" void* prime_ramulator_create(const char* config_path) {
     h->prime_mode = env_enabled("ACCELSIM_RAMULATOR_PRIME_MODE");
     h->prime_direct_mode = env_enabled("ACCELSIM_RAMULATOR_PRIME_DIRECT");
       h->hbm_side_comp_mode = env_enabled("ACCELSIM_HBM_SIDE_COMP_MODE");
+      h->hbm_comp_padded_mapping = env_enabled("ACCELSIM_HBM_COMP_PADDED_MAPPING");
 
     h->prime_decomp_latency = env_int("ACCELSIM_PRIME_DECOMP_LATENCY", 3);
     h->prime_wb_latency = env_int("ACCELSIM_PRIME_WB_LATENCY", 4);
@@ -554,7 +670,7 @@ extern "C" void* prime_ramulator_create(const char* config_path) {
                   env_int("ACCELSIM_HBM_COMP_COMPRESSED_CHUNK_BYTES", 96));
       h->hbm_comp_tx_bytes = env_int("ACCELSIM_HBM_COMP_TX_BYTES", 32);
       h->hbm_comp_decomp_latency =
-          env_int("ACCELSIM_HBM_COMP_DECOMP_LATENCY", 3);
+          env_int_nonnegative("ACCELSIM_HBM_COMP_DECOMP_LATENCY", 3);
       h->hbm_comp_mapping_latency =
           env_int_nonnegative("ACCELSIM_HBM_COMP_MAPPING_LATENCY", 0);
 
@@ -588,12 +704,19 @@ extern "C" void* prime_ramulator_create(const char* config_path) {
               << " prime_decomp_latency=" << h->prime_decomp_latency
               << " prime_wb_latency=" << h->prime_wb_latency
               << "\n";
+      g_hbm_comp_last_bridge = h;
+      if (!g_hbm_comp_atexit_registered) {
+        std::atexit(hbm_comp_atexit_dump);
+        g_hbm_comp_atexit_registered = true;
+      }
+
       std::cerr << "[hbm_side_comp_config]"
                 << " hbm_side_comp_mode=" << (h->hbm_side_comp_mode ? 1 : 0)
                 << " hbm_comp_chunk_bytes=" << h->hbm_comp_chunk_bytes
                 << " hbm_comp_compressed_bytes=" << h->hbm_comp_compressed_bytes
                 << " hbm_comp_decomp_latency=" << h->hbm_comp_decomp_latency
                 << " hbm_comp_mapping_latency=" << h->hbm_comp_mapping_latency
+                << " hbm_comp_padded_mapping=" << (h->hbm_comp_padded_mapping ? 1 : 0)
                 << "\n";
 
 
